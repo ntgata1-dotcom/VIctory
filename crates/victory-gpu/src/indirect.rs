@@ -4,7 +4,15 @@
 //! billion vertices or a dispatch past the host's limits runs until the
 //! host resets the display driver. So every record is clamped on the GPU,
 //! just before its execution, by a compute shader of ours (HLSL compiled by
-//! the system's compiler; a 5.1 shader with its root signature inside).
+//! the system's compiler, a 5.1 shader; its root signature is made beside
+//! it).
+//!
+//! The source keeps to what Wine's compiler takes as well as Microsoft's:
+//! it has no methods on byte address buffers (`Load`, `Store`) and ignores
+//! a `RootSignature` attribute, and without the clamp every indirect
+//! execution is dropped. So the buffers are structured buffers of `uint`,
+//! which a root descriptor can be, and records are indexed in words: the
+//! caller already refuses addresses and strides that are not multiples of 4.
 //!
 //! Each list also has a budget (2^27 vertex instances or threads, groups
 //! counted as 64 threads, mesh groups as 128): records past it run empty,
@@ -24,38 +32,42 @@ use windows::core::s;
 use crate::host::{HostList, host, transition};
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=4, b0), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) { uint kind; uint stride; uint records; uint unused; };
-RWByteAddressBuffer args : register(u0);
+RWStructuredBuffer<uint> args : register(u0);
 // The list's work so far (vertex instances, threads): past the budget,
 // records run empty.
-RWByteAddressBuffer budget : register(u1);
+RWStructuredBuffer<uint> budget : register(u1);
 static const uint BUDGET = 1u << 27;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
-// Clamps the record at `at` in place; its cost.
+// Clamps the record at word `at` in place; its cost.
 uint clamped(uint at) {
     uint cost;
     if (kind <= 1) {
         // Draws: vertex or index count, then instances.
-        uint count = min(args.Load(at), 1u << 24);
-        uint instances = min(args.Load(at + 4), (1u << 26) / max(count, 1u));
+        uint count = min(args[at], 1u << 24);
+        uint instances = min(args[at + 1], (1u << 26) / max(count, 1u));
         cost = count * instances;
-        args.Store2(at, uint2(count, instances));
+        args[at] = count;
+        args[at + 1] = instances;
     } else if (kind == 2) {
-        uint3 g = min(args.Load3(at), uint3(65535, 65535, 65535));
+        uint3 g = min(uint3(args[at], args[at + 1], args[at + 2]), uint3(65535, 65535, 65535));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
         }
         cost = g.x * g.y * g.z * 64;
-        args.Store3(at, g);
+        args[at] = g.x;
+        args[at + 1] = g.y;
+        args[at + 2] = g.z;
     } else {
         // Mesh dispatches: the console's are one-dimensional.
-        uint3 g = args.Load3(at);
+        uint3 g = uint3(args[at], args[at + 1], args[at + 2]);
         g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
         cost = g.x * g.y * g.z * 128;
-        args.Store3(at, g);
+        args[at] = g.x;
+        args[at + 1] = g.y;
+        args[at + 2] = g.z;
     }
     return cost;
 }
@@ -66,16 +78,16 @@ groupshared uint costs[64];
 // record, then the first lane charges the tile's records in order. No
 // other group shares the budget: a shared add wraps once enough records
 // are rejected, and a compare-exchange retries more the more records fit.
-[RootSignature(RS)]
 [numthreads(64, 1, 1)]
 void main(uint lane : SV_GroupIndex) {
     uint left = 0;
     if (lane == 0) {
-        left = BUDGET - min(budget.Load(0), BUDGET);
+        left = BUDGET - min(budget[0], BUDGET);
     }
     for (uint tile = 0; tile < records / 64 + min(records % 64, 1u); tile++) {
         uint record = tile * 64 + lane;
-        uint at = record * stride;
+        // In words: the stride is a multiple of 4.
+        uint at = record * (stride / 4);
         uint cost = 0;
         if (record < records) {
             cost = clamped(at);
@@ -97,11 +109,11 @@ void main(uint lane : SV_GroupIndex) {
         GroupMemoryBarrierWithGroupSync();
         if (costs[lane] == PAST) {
             // Draws keep their layout with no vertices; groups become zero.
-            args.Store(at, 0);
+            args[at] = 0;
         }
     }
     if (lane == 0) {
-        budget.Store(0, BUDGET - left);
+        budget[0] = BUDGET - left;
     }
 }
 "#;
@@ -127,6 +139,72 @@ fn clamp() -> Option<&'static Clamp> {
             }
         })
         .as_ref()
+}
+
+/// The clamp's root signature: the record constants (b0), the arguments
+/// (u0) and the budget (u1) as root descriptors.
+fn root_signature(device: &ID3D12Device) -> windows::core::Result<ID3D12RootSignature> {
+    let view = |register| D3D12_ROOT_PARAMETER1 {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
+        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                ShaderRegister: register,
+                RegisterSpace: 0,
+                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let params = [
+        D3D12_ROOT_PARAMETER1 {
+            ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+            Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                Constants: D3D12_ROOT_CONSTANTS {
+                    ShaderRegister: 0,
+                    RegisterSpace: 0,
+                    Num32BitValues: 4,
+                },
+            },
+            ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+        },
+        view(0),
+        view(1),
+    ];
+    let desc = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_1,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_1: D3D12_ROOT_SIGNATURE_DESC1 {
+                NumParameters: params.len() as u32,
+                pParameters: params.as_ptr(),
+                NumStaticSamplers: 0,
+                pStaticSamplers: std::ptr::null(),
+                Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE,
+            },
+        },
+    };
+    // SAFETY: the description points at a live array; the blob is read in
+    // full before it is released.
+    unsafe {
+        let mut blob: Option<ID3DBlob> = None;
+        let mut error: Option<ID3DBlob> = None;
+        if let Err(e) = D3D12SerializeVersionedRootSignature(&desc, &mut blob, Some(&mut error)) {
+            if let Some(error) = error {
+                let text = std::slice::from_raw_parts(
+                    error.GetBufferPointer().cast::<u8>(),
+                    error.GetBufferSize(),
+                );
+                tracing::warn!(
+                    "argument clamp root signature: {}",
+                    String::from_utf8_lossy(text)
+                );
+            }
+            return Err(e);
+        }
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
 }
 
 fn make() -> windows::core::Result<Clamp> {
@@ -160,10 +238,10 @@ fn make() -> windows::core::Result<Clamp> {
         return Err(e);
     }
     let code = code.ok_or_else(windows::core::Error::empty)?;
-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
+    let root = root_signature(device)?;
+    // SAFETY: the blob's own bytes.
     unsafe {
         let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
         let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {

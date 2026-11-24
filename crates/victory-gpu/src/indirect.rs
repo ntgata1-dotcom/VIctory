@@ -322,6 +322,42 @@ fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clamp_preserves_record_offsets_and_shared_budget() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let mut words = Box::new([[0x55aa_55aau32; 8]; 6]);
+        words[1][..2].copy_from_slice(&[16_777_223, 5]);
+        words[2][..3].copy_from_slice(&[3, 2, 1]);
+        words[3][..3].copy_from_slice(&[65_536, 17, 2]);
+        words[4][..3].copy_from_slice(&[70_000, 7, 2]);
+        words[5][..2].copy_from_slice(&[16_777_216, 4]);
+        let mut expected = *words;
+        expected[1][..2].copy_from_slice(&[16_777_216, 4]);
+        expected[3][..3].copy_from_slice(&[0, 0, 0]);
+        expected[4][..3].copy_from_slice(&[65_535, 1, 1]);
+        expected[5][..2].copy_from_slice(&[0, 4]);
+
+        let at = words.as_mut_ptr() as u64;
+        let len = std::mem::size_of_val(words.as_ref()) as u64;
+        crate::shadow::register(at as usize, at, len);
+        let shadow = crate::shadow::find(at, len).unwrap();
+        let list = host.new_list().expect("command list");
+        shadow.refresh(&list, at, len);
+        shadow.gpu_writes(&list, at, len, false);
+        for (kind, row, records) in [(0, 1, 1), (2, 2, 2), (10, 4, 1), (1, 5, 1)] {
+            let gpu = shadow.gpu(at + row * 32);
+            assert!(super::bound(&list, &shadow.buffer, gpu, (kind, 32, records)));
+            super::done(&list, &shadow.buffer);
+        }
+        list.close();
+        host.execute(&[&list]);
+        crate::shadow::unregister(at as usize, at);
+        assert_eq!(*words, expected);
+        eprintln!("all clamp output words and padding matched");
+    }
+
     /// The clamp compiles with the system's compiler and the host takes it.
     #[test]
     fn argument_clamp_builds() {
